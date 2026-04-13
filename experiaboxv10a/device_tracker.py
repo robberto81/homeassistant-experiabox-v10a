@@ -1,13 +1,7 @@
-"""
-Support for ExperiaBox V10A
-"""
-import base64
-import hashlib
+"""Support for ExperiaBox V10A (firmware V10A.C.26+, Sagemcom JSON-RPC API)."""
+import json
 import logging
-import os
-import re
 from collections import namedtuple
-from datetime import datetime, timezone
 
 import requests
 import voluptuous as vol
@@ -15,167 +9,215 @@ import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
 from homeassistant.components.device_tracker import (
-    DOMAIN, PLATFORM_SCHEMA, DeviceScanner)
-from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME, CONF_SSL, CONF_SCAN_INTERVAL
+    DOMAIN,
+    PLATFORM_SCHEMA,
+    DeviceScanner,
+)
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_HOST): cv.string,
     vol.Required(CONF_PASSWORD): cv.string,
-    vol.Required(CONF_USERNAME): cv.string
+    vol.Required(CONF_USERNAME): cv.string,
 })
 
+_SAH_CONTENT_TYPE = 'application/x-sah-ws-4-call+json'
+
+
 def get_scanner(hass, config):
-    """Validate the configuration and return an ExperiaBox V10A device scanner."""
+    """Return an ExperiaBoxV10ADeviceScanner, or None on failure."""
     try:
         return ExperiaBoxV10ADeviceScanner(config[DOMAIN])
     except ConnectionError:
         return None
 
+
 Device = namedtuple('Device', ['mac', 'name', 'ip', 'last_update'])
 
+
+def _best_name(device):
+    """Return the best display name (webui > dhcp > mdns > default)."""
+    for source in ('webui', 'dhcp', 'mdns'):
+        for entry in device.get('Names', []):
+            if entry.get('Source') == source and entry.get('Name'):
+                return entry['Name']
+    return device.get('Name', '')
+
+
+def _best_ipv4(device):
+    """Return the first global IPv4 address for a device."""
+    for addr in device.get('IPv4Address', []):
+        ip = addr.get('Address', '')
+        if ip and ':' not in ip:
+            return ip
+    ip = device.get('IPAddress', '')
+    if ip and ':' not in ip:
+        return ip
+    return ''
+
+
+def _collect_active_devices(nodes):
+    """Recursively collect active client devices from the topology tree."""
+    devices = []
+    for node in nodes:
+        if node.get('DiscoverySource') == 'selflan':
+            # Router interface node — descend into children
+            devices.extend(
+                _collect_active_devices(node.get('Children', []))
+            )
+        else:
+            if node.get('Active', False):
+                devices.append(node)
+            devices.extend(
+                _collect_active_devices(node.get('Children', []))
+            )
+    return devices
+
+
 class ExperiaBoxV10ADeviceScanner(DeviceScanner):
-    """This class queries an Experia Box V10A."""
+    """Query an Experia Box V10A via its Sagemcom JSON-RPC API."""
 
     def __init__(self, config):
-        """Initialize the scanner."""
-        host = config[CONF_HOST]
-        username, password = config[CONF_USERNAME], config[CONF_PASSWORD]
-        ssl = True
-
-        self.ca_cert_bundle = os.path.join(os.path.dirname(__file__), 'ca-bundle-kpn-pkio-g3-server.pem')
-
-        self.parse_macs = re.compile('[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}')
-
-        self.base_url = 'http{}://{}'.format('s' if ssl else '', host)
-
-        self.username = hashlib.sha512(hashlib.md5(username.encode('utf-8')).hexdigest().encode('utf-8')).hexdigest()
-
-        self.password = hashlib.sha512(hashlib.md5(password.encode('utf-8')).hexdigest().encode('utf-8')).hexdigest()
-
+        """Initialise the scanner."""
+        self.host = config[CONF_HOST]
+        self.username = config[CONF_USERNAME]
+        self.password = config[CONF_PASSWORD]
+        self.base_url = 'http://{}'.format(self.host)
         self.last_results = []
         self.success_init = self._update_info()
 
     def scan_devices(self):
-        """Scan for new devices and return a list with found device IDs."""
+        """Scan for new devices and return a list of found device IDs."""
         self._update_info()
         return [device.mac for device in self.last_results]
 
     def get_device_name(self, device):
-        """Return the name of the given device or None if we don't know."""
-        filter_named = [result.name for result in self.last_results
-                        if result.mac == device]
-
-        if filter_named:
-            return filter_named[0]
-        return None
+        """Return the name of the given device, or None if unknown."""
+        matches = [r.name for r in self.last_results if r.mac == device]
+        return matches[0] if matches else None
 
     def get_extra_attributes(self, device):
-        """Return the extra attibutes of the given device."""
-        filter_device = next((
-            result for result in self.last_results
-            if result.mac == device), None)
-        return {'ip': filter_device.ip}
+        """Return extra attributes for the given device."""
+        match = next(
+            (r for r in self.last_results if r.mac == device), None
+        )
+        return {'ip': match.ip} if match else {}
+
+    def _ws_post(self, session, service, method, parameters, auth_header):
+        """POST a Sagemcom JSON-RPC call and return the response dict."""
+        url = '{}/ws/{}:{}'.format(self.base_url, service, method)
+        payload = json.dumps({
+            'service': service,
+            'method': method,
+            'parameters': parameters,
+        })
+        try:
+            resp = session.post(
+                url,
+                data=payload,
+                headers={
+                    'authorization': auth_header,
+                    'content-type': _SAH_CONTENT_TYPE,
+                    'origin': self.base_url,
+                    'referer': '{}/'.format(self.base_url),
+                },
+                timeout=10,
+            )
+        except requests.exceptions.Timeout:
+            _LOGGER.error('Request timed out: %s:%s', service, method)
+            return None
+        except requests.exceptions.RequestException as exc:
+            _LOGGER.error(
+                'Request failed (%s:%s): %s', service, method, exc
+            )
+            return None
+
+        try:
+            return resp.json()
+        except ValueError:
+            _LOGGER.error(
+                'Non-JSON response for %s:%s (HTTP %s): %s',
+                service,
+                method,
+                resp.status_code,
+                resp.text[:500],
+            )
+            return None
 
     def _update_info(self):
-        """Ensure the information from the ExperiaBox V10A is up to date.
-        Return boolean if scanning successful.
-        """
+        """Fetch active devices from the router. Return True on success."""
+        _LOGGER.info('Loading devices...')
 
-        _LOGGER.info("Loading devices...")
-
-        # We need to store a cookie
         session = requests.Session()
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
-        ts = round(datetime.now(timezone.utc).timestamp() * 1000)
+        # Step 1: Authenticate and obtain a context token
+        login_data = self._ws_post(
+            session,
+            service='sah.Device.Information',
+            method='createContext',
+            parameters={
+                'applicationName': 'webui',
+                'username': self.username,
+                'password': self.password,
+            },
+            auth_header='X-Sah-Login',
+        )
 
-        # Retrieve login.htm first, to retrieve the "httoken" to do the actual POST /login.cgi
-        login_url_initial = '{}/login.htm'.format(self.base_url)
-        page_initial = session.get(login_url_initial, timeout = 10, verify = self.ca_cert_bundle)
-
-        # Security by obfuscation
-        # The token is "hidden" as a base64 string, and is in the page source as a img with base64 data
-        # the base64 portion that contains the token is appended after "yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-        httoken_search = re.search("yH5BAEAAAAALAAAAAABAAEAAAIBRAA7(.+)\" border=0>", page_initial.text)
-
-        authenticity_token = base64.b64decode(httoken_search.group(1)).decode('utf-8')
-
-        # construct the login payload. the values usr and pws are MD5'd and then the MD5 hash is SHA512'd
-        # no salt
-        login_payload = {
-            "httoken": authenticity_token,
-            "usr": self.username,
-            "pws": self.password
-        }
-
-        login_url = '{}/login.cgi'.format(self.base_url)
-        # this request will reply with a 302 Found, we don't want to be redirected just yet in order to do error handling
-        start_page = session.post(login_url, allow_redirects = False, data = login_payload, timeout = 10, verify = self.ca_cert_bundle, headers = {'referer': '{}/login.htm'.format(self.base_url)})
-
-        _LOGGER.debug('login.cgi start_page')
-        _LOGGER.debug(start_page.status_code)
-        _LOGGER.debug(start_page.headers['Location'])
-        # Some error handling
-        if start_page.headers['Location'] == '/login.htm?err=2':
-            # There's still a session active, and only 1 active session is allowed
-            _LOGGER.error('Could not log in to the device. Only one concurrent session is allowed.')
+        if login_data is None:
             return False
 
-        if start_page.headers['Location'] != '/index.htm':
-            _LOGGER.error('Could not log in to the device. Got redirected to {}'.format(start_page.headers['Location']))
+        if login_data.get('status') != 0:
+            _LOGGER.error('Login failed. Response: %s', login_data)
             return False
 
-        index_page = session.get('{}{}'.format(self.base_url, start_page.headers['Location']), timeout = 10, verify = self.ca_cert_bundle, headers = {'referer': '{}/login.htm'.format(self.base_url)})
+        context_id = login_data.get('data', {}).get('contextID')
+        if not context_id:
+            _LOGGER.error(
+                'Login succeeded but no contextID in response: %s',
+                login_data,
+            )
+            return False
 
-        _LOGGER.debug('index.htm index_page')
-        _LOGGER.debug(index_page.status_code)
+        _LOGGER.debug('Authenticated successfully, contextID obtained.')
 
-        # this is the token that needs to be used to log out
-        index_httoken_search = re.search("yH5BAEAAAAALAAAAAABAAEAAAIBRAA7(.+)\" border=0>", index_page.text)
-        index_authenticity_token = base64.b64decode(index_httoken_search.group(1)).decode('utf-8')
+        # Step 2: Fetch the LAN device topology
+        topo_data = self._ws_post(
+            session,
+            service='Devices.Device.lan',
+            method='topology',
+            parameters={
+                'expression': 'not logical',
+                'flags': 'no_recurse|no_actions',
+            },
+            auth_header='X-Sah {}'.format(context_id),
+        )
 
-        result = False
-        try:
-            data_url = '{}/cgi/cgi_clients.js?_tn={}'.format(self.base_url, index_authenticity_token, ts, ts)
-            data_page = session.get(data_url, timeout = 10, verify = self.ca_cert_bundle, headers = {'referer': '{}/index.htm?t={}'.format(self.base_url, ts)})
-            _LOGGER.debug('cgi_clients.js data_page')
-            _LOGGER.debug(data_page.status_code)
-            # response is a javascript file with various information, for now we just want the online clients.
-            data_search = re.search("var online_client=\\[(.*?)\\];", data_page.text, re.DOTALL)
-            result = data_search.group(1).split('\n,')
-        except requests.exceptions.Timeout:
-            _LOGGER.error('Could not fetch cgi_clients, a timeout occurred.')
+        if topo_data is None:
+            return False
 
-        # log out using the token we stored earlier
-        logout_payload = {
-            "httoken": index_authenticity_token
-        }
-
-        logout_url = '{}/logout.cgi'.format(self.base_url)
-        log_out_page = session.post(logout_url, data = logout_payload, timeout = 10, verify=False, headers = {'referer': '{}/index.htm'.format(self.base_url)})
+        root_nodes = topo_data.get('status')
+        if not isinstance(root_nodes, list):
+            _LOGGER.error(
+                'Unexpected topology response: %s', str(topo_data)[:500]
+            )
+            return False
 
         now = dt_util.now()
+        active_devices = _collect_active_devices(root_nodes)
 
-        # start with an empty list, we will add all the devices we see
         last_results = []
-        if result:
-            _LOGGER.info('Got {} devices'.format(len(result)))
-            for line in result:
-                # Get rid of the single quotes
-                device = [item.replace("'", "") for item in line.split(',')]
-                # Parse the raw line
-                name = device[0]
-                ip = device[1]
-                mac = device[2]
+        for device in active_devices:
+            mac = device.get('PhysAddress', '').upper()
+            if not mac:
+                continue
+            name = _best_name(device)
+            ip = _best_ipv4(device)
+            last_results.append(Device(mac, name, ip, now))
+            _LOGGER.debug('Found device: %s (%s) @ %s', name, mac, ip)
 
-                _LOGGER.debug(device)
-
-                last_results.append(Device(mac.upper(), name, ip, now))
-
-            # replace the last results list, any devices that left will eventually report "not_home"
-            self.last_results = last_results
-            return True
-        _LOGGER.error('Got no devices')
-        return False
+        _LOGGER.info('Got %d active devices', len(last_results))
+        self.last_results = last_results
+        return True
