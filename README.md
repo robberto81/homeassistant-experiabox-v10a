@@ -33,7 +33,7 @@ In order to enable this custom device_tracker component, add this code snippet t
 ```yaml
 device_tracker:
   - platform: experiaboxv10a
-    host: mijnmodem.kpn
+    host: router_ip
     username: admin
     password: PASSWORD
 ```
