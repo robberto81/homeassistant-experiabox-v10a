@@ -45,4 +45,17 @@ This device_tracker queries the Experia Box V10A directly.
 If you are using an Experia Wifi access point in conjunction with your Experia Box V10A, the clients connected to the Experia Wifi access point will also be reported by this device_tracker.
 
 ## Troubleshooting
-I have observed that sometimes the Experiabox V10A times out on the `GET /cgi/cgi_clients.js` call. What I did to work around this problem is rebooting the Experiabox V10A. 
+**Older firmware (before V10A.C.26):** The original implementation used HTML 
+scraping and `GET /cgi/cgi_clients.js`. If you are on an older firmware, 
+use version 0.2.1 of this component.
+
+**Newer firmware (V10A.C.26+):** The web interface was replaced with a 
+Flutter-based UI using a Sagemcom JSON-RPC API. Version 0.3.0+ of this 
+component supports this new API. The router is accessed over plain HTTP 
+(no SSL), so the `.pem` certificate file is no longer needed and has been 
+removed from the repository.
+
+> **Note:** Credentials are sent in plaintext over HTTP. This is only safe 
+> on your local network, which is the intended use case.
+
+If the component fails to authenticate, check your username and password in the router web interface at http://<router_ip>/.
